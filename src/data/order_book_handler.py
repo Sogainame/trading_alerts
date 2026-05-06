@@ -87,20 +87,25 @@ def _update_wall_tracking(
                 existing.last_size = qty
                 existing.last_seen_ts = now
         else:
-            # Уровень не крупный сейчас. Но если он был крупным и резко уменьшился —
-            # это потенциальное absorption-событие.
-            if existing is not None and existing.initial_notional >= ABSORPTION_MIN_INITIAL_USD:
-                shrink_ratio = qty / existing.initial_size if existing.initial_size > 0 else 0
-                if shrink_ratio <= ABSORPTION_REMNANT_PCT:
-                    # Wall сильно сократился = его поглотили
-                    ob.recent_absorptions.append(
-                        (now, side, price, existing.initial_notional)
+            # Уровень больше не крупный. Удаляем из tracking ВСЕГДА —
+            # держать "wall с устаревшим размером" опасно (детектор и targets
+            # будут использовать старое event.notional, и алерт скажет "стена $229k"
+            # когда реально осталось $80k).
+            #
+            # Если падение резкое (≤ABSORPTION_REMNANT_PCT от initial) —
+            # это absorption, отметим в recent_absorptions для wall_absorption
+            # детектора. Иначе просто silently drop (cancel или slow shrink).
+            if existing is not None:
+                if existing.initial_notional >= ABSORPTION_MIN_INITIAL_USD:
+                    shrink_ratio = (
+                        qty / existing.initial_size
+                        if existing.initial_size > 0 else 0
                     )
-                    del ob.level_history[key]
-                else:
-                    # Просто частичное уменьшение — обновляем, продолжаем трекать
-                    existing.last_size = qty
-                    existing.last_seen_ts = now
+                    if shrink_ratio <= ABSORPTION_REMNANT_PCT:
+                        ob.recent_absorptions.append(
+                            (now, side, price, existing.initial_notional)
+                        )
+                del ob.level_history[key]
 
 
 def _cleanup_stale_walls(
