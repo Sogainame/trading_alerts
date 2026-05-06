@@ -37,18 +37,6 @@ CREATE TABLE IF NOT EXISTS alerts (
 CREATE INDEX IF NOT EXISTS idx_alerts_symbol ON alerts(symbol);
 CREATE INDEX IF NOT EXISTS idx_alerts_timestamp ON alerts(timestamp);
 CREATE INDEX IF NOT EXISTS idx_alerts_tier ON alerts(tier);
-
-CREATE TABLE IF NOT EXISTS followups (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    alert_id INTEGER NOT NULL,
-    delay_seconds INTEGER NOT NULL,
-    timestamp REAL NOT NULL,
-    price REAL NOT NULL,
-    pct_change REAL NOT NULL,
-    FOREIGN KEY (alert_id) REFERENCES alerts(id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_followups_alert ON followups(alert_id);
 """
 
 

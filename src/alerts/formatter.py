@@ -77,21 +77,3 @@ def format_alert(
                 lines.append(f"{rr_emoji} RR: <b>1:{rr:.2f}</b>")
 
     return "\n".join(lines)
-
-
-def format_followup(
-    symbol: str, entry_price: float, current_price: float, delay_minutes: int
-) -> str:
-    change_pct = ((current_price - entry_price) / entry_price) * 100
-    if change_pct > 0:
-        emoji, sign = "📈", "+"
-    elif change_pct < 0:
-        emoji, sign = "📉", ""
-    else:
-        emoji, sign = "➖", ""
-    return (
-        f"{emoji} <b>{symbol}</b> • +{delay_minutes} мин\n"
-        f"Вход: <code>{entry_price:,.6g}</code> → "
-        f"Сейчас: <code>{current_price:,.6g}</code>\n"
-        f"Изменение: <b>{sign}{change_pct:.2f}%</b>"
-    )

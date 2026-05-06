@@ -45,9 +45,6 @@ ONLY_BULLISH = True
 # === Cooldown ===
 ALERT_COOLDOWN_SECONDS = 30 * 60  # 30 мин на пару
 
-# === Follow-ups: replies на алерт через эти интервалы ===
-FOLLOWUP_DELAYS_SECONDS = (5 * 60, 15 * 60, 30 * 60)
-
 # === Scoring tiers ===
 TIER_WATCH = 50
 TIER_STRONG = 70

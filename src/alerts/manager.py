@@ -6,20 +6,17 @@ AlertManager — единая точка отправки алертов.
   2. Проверяет ONLY_BULLISH флаг
   3. Проверяет cooldown
   4. Считает targets (стоп/цель из стакана)
-  5. Отправляет в Telegram, получает message_id
+  5. Отправляет в Telegram
   6. Логирует в SQLite
-  7. Планирует follow-up'ы
 """
 import logging
 import time
 
 from config import (
     ALERT_COOLDOWN_SECONDS,
-    FOLLOWUP_DELAYS_SECONDS,
     ONLY_BULLISH,
     SCORE_MIN_TO_ALERT,
 )
-from src.alerts.followup import FollowupScheduler
 from src.alerts.formatter import format_alert
 from src.alerts.targets import find_targets
 from src.core.state import SymbolState
@@ -35,11 +32,9 @@ class AlertManager:
     def __init__(
         self,
         notifier: TelegramNotifier,
-        followup: FollowupScheduler,
         signal_logger: SignalLogger,
     ):
         self.notifier = notifier
-        self.followup = followup
         self.signal_logger = signal_logger
 
     async def maybe_alert(
@@ -57,12 +52,10 @@ class AlertManager:
         if now - state.last_alert_at < ALERT_COOLDOWN_SECONDS:
             return
 
-        # Анти-спам volume-anomaly
         has_volume_anomaly = any(
             s.detector_name == "VOLUME_ANOMALY" for s in result.signals
         )
 
-        # Считаем targets из стакана (если стакан проинициализирован)
         targets = find_targets(state, current_price)
 
         msg = format_alert(state.symbol, result, current_price, targets)
@@ -86,14 +79,6 @@ class AlertManager:
             signals=result.signals,
             message_id=message_id,
         )
-
-        for delay in FOLLOWUP_DELAYS_SECONDS:
-            self.followup.schedule(
-                symbol=state.symbol,
-                entry_price=current_price,
-                delay_seconds=delay,
-                reply_to_message_id=message_id,
-            )
 
         logger.info(
             f"ALERT [{result.tier} {result.score}] {state.symbol} "

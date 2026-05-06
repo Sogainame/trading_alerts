@@ -17,7 +17,6 @@ import logging
 from typing import List
 
 from config import TIMEFRAMES
-from src.alerts.followup import FollowupScheduler
 from src.alerts.manager import AlertManager
 from src.core.state import Candle, GlobalState, SymbolState, Trade
 from src.data.binance_rest import BinanceREST
@@ -46,9 +45,8 @@ class Scanner:
         self.rest = BinanceREST()
         self.notifier = TelegramNotifier()
         self.signal_logger = SignalLogger()
-        self.followup = FollowupScheduler(self.notifier, self.rest)
         self.alert_manager = AlertManager(
-            self.notifier, self.followup, self.signal_logger
+            self.notifier, self.signal_logger
         )
         self.symbols: List[str] = []
 
@@ -185,7 +183,6 @@ class Scanner:
             ws = WebSocketManager(streams, self.handle_ws_message)
             await ws.run_forever()
         finally:
-            await self.followup.shutdown()
             await self.signal_logger.close()
             await self.notifier.close()
             await self.rest.close()
