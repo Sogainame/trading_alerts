@@ -18,8 +18,23 @@ EXCLUDE_SYMBOLS = {
     "EURUSDT", "GBPUSDT", "AUDUSDT", "JPYUSDT", "RUBUSDT", "TRYUSDT", "USD1USDT",
 }
 
-# === Сколько топ-пар сканируем (по 24h объёму USDT на споте) ===
+# === Сколько топ-пар сканируем ===
 TOP_N_PAIRS = 30
+
+# === Как ранжируем пары для отбора ===
+# "volatility_range" — (high - low) / avg_price * 100 — реальный размах,
+#                     ловит "горки" с осцилляциями. ⭐ для скальпинга
+# "price_change_abs" — abs(priceChangePercent), 24h direction movement
+# "volume"           — quoteVolume, 24h объём в USDT (старое поведение)
+RANKING_METRIC = "volatility_range"
+
+# === Минимальный 24h объём (USDT) — фильтр от низкой ликвидности ===
+# Без этого фильтра бот может выбрать памп-говно где спред 2% и slippage 1%
+MIN_DAILY_VOLUME_USD = 10_000_000  # $10M
+
+# === Минимальная волатильность (% range) для попадания в скан ===
+# Ниже этого — пара слишком "плоская", не интересно для скальпинга
+MIN_VOLATILITY_RANGE_PCT = 3.0
 
 # === Таймфреймы (свечные стримы) ===
 TIMEFRAMES = ("5m", "15m", "1h")
