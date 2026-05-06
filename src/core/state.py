@@ -6,7 +6,7 @@ State — lock-free dict + deque. Работает потому что весь 
 """
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Deque, Dict, List, Optional
+from typing import Deque, Dict, List, Optional, Tuple
 
 
 @dataclass
@@ -25,6 +25,61 @@ class Trade:
     def is_market_buy(self) -> bool:
         # is_buyer_maker == False → taker — это buyer (он "съел" ask) → market buy
         return not self.is_buyer_maker
+
+
+@dataclass
+class WallEvent:
+    """
+    Запись о появлении/исчезновении крупного ордера на конкретной цене.
+    Используется для anti-spoof фильтра (Static Wall) и Wall Absorption детектора.
+    """
+    price: float
+    side: str               # "bid" | "ask"
+    size: float             # количество монет
+    notional: float         # size × price (USD)
+    first_seen_ts: float    # секунды
+    last_seen_ts: float
+    last_size: float = 0.0  # последний размер на этом уровне (для absorption)
+    initial_size: float = 0.0
+    initial_notional: float = 0.0
+
+
+@dataclass
+class OrderBookState:
+    """
+    Состояние стакана для одной пары.
+    Bids/asks — это полный snapshot top-20 уровней, обновляется через depth20@100ms.
+    Каждый уровень = (price, quantity).
+
+    История стен (level_history) нужна для двух целей:
+      1. Понимать сколько секунд большой ордер сидит на месте (anti-spoof)
+      2. Детектить когда ордер был большой, потом "съели" (Wall Absorption)
+    """
+    bids: List[Tuple[float, float]] = field(default_factory=list)  # отсортированы по убыванию цены
+    asks: List[Tuple[float, float]] = field(default_factory=list)  # отсортированы по возрастанию цены
+    last_update_ts: float = 0.0
+
+    # Маппинг (side, price) → WallEvent. Хранит активные крупные уровни.
+    level_history: Dict[Tuple[str, float], WallEvent] = field(default_factory=dict)
+
+    # Недавние absorption-события: (timestamp, side, price, initial_notional)
+    recent_absorptions: Deque[Tuple[float, str, float, float]] = field(
+        default_factory=lambda: deque(maxlen=50)
+    )
+
+    @property
+    def best_bid(self) -> Optional[float]:
+        return self.bids[0][0] if self.bids else None
+
+    @property
+    def best_ask(self) -> Optional[float]:
+        return self.asks[0][0] if self.asks else None
+
+    @property
+    def mid_price(self) -> Optional[float]:
+        if self.best_bid is not None and self.best_ask is not None:
+            return (self.best_bid + self.best_ask) / 2
+        return None
 
 
 @dataclass
@@ -74,6 +129,7 @@ class SymbolState:
     candles_15m: Deque[Candle] = field(default_factory=lambda: deque(maxlen=30))
     candles_1h: Deque[Candle] = field(default_factory=lambda: deque(maxlen=24))
     current_5m: Optional[Candle] = None  # форма-в-моменте (intra-candle)
+    order_book: OrderBookState = field(default_factory=OrderBookState)
     last_alert_at: float = 0.0
     last_alert_score: int = 0
     last_volume_anomaly_at: int = 0  # open_time свечи где уже алертили — анти-спам

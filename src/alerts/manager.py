@@ -5,9 +5,10 @@ AlertManager — единая точка отправки алертов.
   1. Проверяет минимальный score
   2. Проверяет ONLY_BULLISH флаг
   3. Проверяет cooldown
-  4. Отправляет в Telegram, получает message_id
-  5. Логирует в SQLite
-  6. Планирует follow-up'ы
+  4. Считает targets (стоп/цель из стакана)
+  5. Отправляет в Telegram, получает message_id
+  6. Логирует в SQLite
+  7. Планирует follow-up'ы
 """
 import logging
 import time
@@ -20,6 +21,7 @@ from config import (
 )
 from src.alerts.followup import FollowupScheduler
 from src.alerts.formatter import format_alert
+from src.alerts.targets import find_targets
 from src.core.state import SymbolState
 from src.detectors.volume_anomaly import mark_volume_anomaly_alerted
 from src.notifier.telegram import TelegramNotifier
@@ -55,13 +57,15 @@ class AlertManager:
         if now - state.last_alert_at < ALERT_COOLDOWN_SECONDS:
             return
 
-        # Анти-спам volume-anomaly: если в текущей формирующейся свече уже был
-        # такой сигнал — не алертим повторно (новый алерт по той же свече = шум)
+        # Анти-спам volume-anomaly
         has_volume_anomaly = any(
             s.detector_name == "VOLUME_ANOMALY" for s in result.signals
         )
 
-        msg = format_alert(state.symbol, result, current_price)
+        # Считаем targets из стакана (если стакан проинициализирован)
+        targets = find_targets(state, current_price)
+
+        msg = format_alert(state.symbol, result, current_price, targets)
         api_result = await self.notifier.send(msg)
         if not api_result:
             return
@@ -73,7 +77,6 @@ class AlertManager:
 
         message_id = api_result.get("message_id")
 
-        # Лог в SQLite (не блокирует)
         await self.signal_logger.log_alert(
             symbol=state.symbol,
             score=result.score,
@@ -84,7 +87,6 @@ class AlertManager:
             message_id=message_id,
         )
 
-        # Запланировать follow-up'ы
         for delay in FOLLOWUP_DELAYS_SECONDS:
             self.followup.schedule(
                 symbol=state.symbol,

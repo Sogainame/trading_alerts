@@ -72,5 +72,32 @@ MULTI_TF_VOLUME_PERIOD = 20
 MULTI_TF_TREND_EMA = 50  # EMA50 на 1h как фильтр тренда
 MULTI_TF_SCORE = 25
 
+# ───────────────────────────────────────────────────────────────────────
+# ORDER BOOK LAYER (Phase 2A) — детекторы стакана
+# ───────────────────────────────────────────────────────────────────────
+
+# === 6. Static Wall: крупный ордер сидит ≥N секунд ===
+# Спуферы ставят-снимают за <10s. Реальные стены живут дольше.
+STATIC_WALL_MIN_LIFETIME_SECONDS = 30
+STATIC_WALL_MIN_USD = 100_000           # минимальный размер стены чтобы её считать
+STATIC_WALL_TOP_LEVELS = 20             # смотрим только в первых 20 уровнях
+STATIC_WALL_SCORE = 15                  # балл если есть подтверждающая стена снизу/сверху
+
+# === 7. Order Book Imbalance: давление сверху или снизу ===
+OBI_TOP_LEVELS = 20                     # сравниваем суммы первых 20 bids vs asks
+OBI_RATIO_THRESHOLD = 1.8               # bids:asks ≥1.8 = bullish, asks:bids ≥1.8 = bearish
+OBI_SCORE = 15
+
+# === 8. Wall Absorption: стена была → цена дошла → стена исчезла (съедена) ===
+ABSORPTION_MIN_INITIAL_USD = 200_000    # стена должна быть существенной чтобы считалось
+ABSORPTION_REMNANT_PCT = 0.20           # осталось ≤20% от изначального размера
+ABSORPTION_LOOKBACK_SECONDS = 60        # ищем absorption события за последнюю минуту
+ABSORPTION_SCORE = 25                   # это сильнейший сигнал направления
+
+# === Targets calculation (стоп / цель) ===
+# Ищем ближайшие крупные стены — bid снизу = стоп, ask сверху = цель
+TARGET_MIN_WALL_USD = 100_000           # порог чтобы уровень считался "ориентиром"
+TARGET_MAX_DISTANCE_PCT = 3.0           # ищем стены не дальше 3% от текущей цены
+
 # === SQLite ===
 DB_PATH = "data/signals.db"
