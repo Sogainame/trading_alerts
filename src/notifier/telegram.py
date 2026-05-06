@@ -3,7 +3,7 @@
 Используем httpx async — лёгкий и не тащим тяжёлый python-telegram-bot framework.
 """
 import logging
-from typing import List
+from typing import List, Optional
 
 import httpx
 
@@ -23,24 +23,34 @@ class TelegramNotifier:
         self.api_url = f"https://api.telegram.org/bot{token}/sendMessage"
         self._client = httpx.AsyncClient(timeout=10.0)
 
-    async def send(self, text: str) -> bool:
+    async def send(self, text: str, reply_to: Optional[int] = None) -> Optional[dict]:
+        """
+        Отправить сообщение. Возвращает result dict из Telegram API
+        (содержит message_id для последующих reply) или None при ошибке.
+
+        Если передан reply_to — сообщение будет ответом на сообщение с этим id.
+        """
+        payload = {
+            "chat_id": self.chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }
+        if reply_to is not None:
+            payload["reply_to_message_id"] = reply_to
+            # Если оригинальное сообщение удалено — всё равно отправим, без ошибки
+            payload["allow_sending_without_reply"] = True
+
         try:
-            resp = await self._client.post(
-                self.api_url,
-                json={
-                    "chat_id": self.chat_id,
-                    "text": text,
-                    "parse_mode": "HTML",
-                    "disable_web_page_preview": True,
-                },
-            )
+            resp = await self._client.post(self.api_url, json=payload)
             if resp.status_code != 200:
                 logger.error(f"Telegram API error {resp.status_code}: {resp.text}")
-                return False
-            return True
+                return None
+            data = resp.json()
+            return data.get("result")
         except Exception as e:
             logger.exception(f"Failed to send Telegram message: {e}")
-            return False
+            return None
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -48,8 +58,8 @@ class TelegramNotifier:
 
 def format_alert(symbol: str, signals: List[dict], timeframe: str) -> str:
     """
-    Формирует HTML-строку для Telegram.
-    Все сигналы в одном алерте должны быть однонаправленные (фильтруется в scanner.py).
+    HTML-строка для основного алерта.
+    Все сигналы должны быть однонаправленными (фильтруется в scanner.py).
     """
     pattern_names = {
         "VOLUME_SPIKE": "Volume Spike",
@@ -74,4 +84,31 @@ def format_alert(symbol: str, signals: List[dict], timeframe: str) -> str:
         f"{emoji} <b>{direction_ru}</b> • {pattern_str}\n"
         f"💰 Цена: <code>{price:,.6g}</code>\n"
         f"📊 Объём: <b>{vol_mult:.1f}x</b> от среднего"
+    )
+
+
+def format_followup(
+    symbol: str, entry_price: float, current_price: float, delay_minutes: int
+) -> str:
+    """
+    HTML-строка для follow-up через N минут после алерта.
+    Отправляется reply'ем на исходный алерт.
+    """
+    change_pct = ((current_price - entry_price) / entry_price) * 100
+
+    if change_pct > 0:
+        emoji = "📈"
+        sign = "+"
+    elif change_pct < 0:
+        emoji = "📉"
+        sign = ""
+    else:
+        emoji = "➖"
+        sign = ""
+
+    return (
+        f"{emoji} <b>{symbol}</b> • +{delay_minutes} мин\n"
+        f"Вход: <code>{entry_price:,.6g}</code> → "
+        f"Сейчас: <code>{current_price:,.6g}</code>\n"
+        f"Изменение: <b>{sign}{change_pct:.2f}%</b>"
     )
