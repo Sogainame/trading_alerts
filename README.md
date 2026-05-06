@@ -1,47 +1,79 @@
-# Trading Alerts — Binance Pattern Scanner
+# Trading Alerts v2 — Multi-Detector Pattern Scanner
 
-Сканер технических паттернов на спот-рынке Binance с алертами в Telegram.
+Real-time сканер импульсов на спот-рынке Binance с системой множественных подтверждений и скоринга.
 
-**Phase 1 (MVP):** топ-30 USDT пар, таймфрейм 5m, два детектора:
-- **Volume Spike** — объём текущей свечи > 3× от среднего за 20 свечей
-- **Engulfing** — поглощающая свеча с подтверждением объёмом > 1.5×
+## Архитектура
 
-## Требования
+5 параллельных детекторов работают **независимо**, каждый выдаёт сигнал со своим вкладом в общий score. Алерт срабатывает только когда сумма очков ≥ порога.
 
-- Python 3.10+
-- macOS / Linux
-- Системная библиотека TA-Lib (ставится отдельно от Python-пакета)
+| Детектор | Источник данных | Вес | Что ловит |
+|---|---|---|---|
+| **Velocity** | aggTrade stream | +25 | Цена изменилась на ≥0.5% за 30 секунд |
+| **Taker Imbalance** | aggTrade stream | +20 | ≥70% объёма за 60с — market buys (или sells) |
+| **Whale Trades** | aggTrade stream | +20 | 3+ сделок ≥$50k за 60с в одну сторону |
+| **Volume Anomaly** | kline 5m (in-progress) | +15 | Незакрытая 5m свеча уже накопила ≥2× средний объём |
+| **Multi-TF Pattern** | kline 5m + 1h | +25 | Engulfing 5m + объём + EMA50 на 1h в ту же сторону |
+
+### Скоринг и тиры
+
+```
+Score = Σ score_contribution однонаправленных сигналов − противоположные
+
+≥ 85 → 🔥 PREMIUM (4-5 сигналов совпали — сильнейший edge)
+≥ 70 → 🟢 STRONG  (3-4 сигнала — качественный сигнал)
+≥ 50 → 🟡 WATCH   (1-2 сигнала — обрати внимание)
+< 50 → не алертим
+```
+
+## Скоростные оптимизации
+
+- **Один WebSocket connection** на все потоки (combined stream multiplex до 1024 streams в одном TCP)
+- **`compression=None`** — не тратим CPU на gzip, нужны микросекунды
+- **Lock-free in-memory state** — один event loop, никаких threads/Lock'ов
+- **Direct `websockets` library** вместо python-binance — на 2-3 ms быстрее на сообщение
+- **Async SQLite** через aiosqlite — лог не блокирует горячий путь
+- **Hot-path detectors** работают на rolling deque — O(1) append, O(N) расчёт по фиксированному окну
+
+End-to-end latency: ~150-300 ms (от trade на Binance до уведомления в Telegram), зависит от пинга до Tokyo AWS.
+
+## Что приходит в Telegram
+
+```
+🟢 STRONG • SOLUSDT • Score 78
+Направление: ВВЕРХ
+Цена: 165.42
+━━━━━━━━━━━━━━━━━━━━
+✅ +1.2% за 30s  (+25)
+✅ Takers: 78% buys (60s)  (+20)
+✅ 4 whale buys ≥$50k за 60s ($240k)  (+20)
+✅ Vol 2.1x avg (intra-5m, ещё не закрылась)  (+15)
+```
+
+Через **5/15/30 минут** на это сообщение прилетают reply-апдейты с %изменения цены — для последующего анализа точности.
 
 ## Установка
 
-### 1. Установить TA-Lib (системная C-библиотека)
+### 1. TA-Lib (системная C-библиотека)
 
 **macOS:**
 ```bash
 brew install ta-lib
 ```
 
-**Linux (Ubuntu/Debian):**
+**Linux:**
 ```bash
 wget http://prdownloads.sourceforge.net/ta-lib/ta-lib-0.4.0-src.tar.gz
-tar -xzf ta-lib-0.4.0-src.tar.gz
-cd ta-lib/
-./configure --prefix=/usr
-make
-sudo make install
+tar -xzf ta-lib-0.4.0-src.tar.gz && cd ta-lib/
+./configure --prefix=/usr && make && sudo make install
 ```
 
-> Без этого шага `pip install TA-Lib` упадёт с ошибкой компиляции.
-
-### 2. Клонировать проект и поставить Python-зависимости
+### 2. Клонировать и поставить Python deps
 
 ```bash
 git clone https://github.com/Sogainame/trading_alerts.git
 cd trading_alerts
-
 python3 -m venv venv
 source venv/bin/activate
-
 pip install -r requirements.txt
 ```
 
@@ -51,88 +83,91 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Открыть `.env` и заполнить:
-
+Содержимое `.env`:
 ```
-TELEGRAM_BOT_TOKEN=1234567890:AAH-bot-token-from-BotFather
-TELEGRAM_CHAT_ID=123456789
+TELEGRAM_BOT_TOKEN=токен_от_BotFather
+TELEGRAM_CHAT_ID=твой_chat_id
 ```
-
-**Где взять:**
-- Токен — у [@BotFather](https://t.me/BotFather), команда `/newbot`
-- Chat ID — после `/start` боту: открыть в браузере `https://api.telegram.org/bot<ТОКЕН>/getUpdates` и найти `"chat":{"id":...}`
 
 ### 4. Запуск
 
 ```bash
+caffeinate -i python main.py    # macOS, чтобы мак не спал
+# или
 python main.py
 ```
-
-В Telegram должно прийти сообщение `🟢 Scanner started`. Дальше ждём первый закрытый бар на одной из пар.
-
-## Что бот делает по шагам
-
-1. На старте через REST API получает топ-30 USDT-пар по 24h объёму на споте Binance
-2. Подгружает по каждой паре последние ~50 закрытых свечей 5m (для расчёта средних)
-3. Открывает один WebSocket с мультиплексной подпиской на kline-стримы всех пар
-4. На событии "свеча закрыта" (`k.x == True`) прогоняет её через детекторы
-5. Если паттерн найден И прошёл фильтры И не cooldown — шлёт алерт в Telegram
-6. При падении WebSocket — перезапускается автоматически через 10 секунд
-
-## Конфигурация
-
-Все параметры в `config.py`:
-
-| Параметр | Значение по умолчанию | Что делает |
-|---|---|---|
-| `TOP_N_PAIRS` | 30 | Сколько пар мониторим |
-| `TIMEFRAME` | `"5m"` | Таймфрейм свечей |
-| `CANDLE_BUFFER_SIZE` | 50 | Сколько свечей хранить в памяти |
-| `VOLUME_SPIKE_MULTIPLIER` | 3.0 | Чувствительность Volume Spike |
-| `VOLUME_AVG_PERIOD` | 20 | Сколько свечей для расчёта среднего объёма |
-| `ENGULFING_VOLUME_MULTIPLIER` | 1.5 | Минимальный объём для Engulfing |
-| `ALERT_COOLDOWN_SECONDS` | 1800 | Cooldown между алертами на одной паре (сек) |
 
 ## Структура проекта
 
 ```
 trading_alerts/
-├── main.py                    # entry point + auto-restart
-├── config.py                  # все настройки
-├── requirements.txt
-├── .env.example
+├── main.py                          # entry + auto-restart
+├── config.py                        # все веса и пороги
+├── data/
+│   └── signals.db                   # SQLite log (gitignored)
 └── src/
+    ├── core/
+    │   └── state.py                 # Trade, Candle, SymbolState, GlobalState
     ├── data/
-    │   ├── pairs.py           # топ USDT пар по объёму
-    │   └── candle_buffer.py   # кольцевой буфер свечей
-    ├── patterns/
-    │   ├── volume_spike.py    # детектор Volume Spike
-    │   └── engulfing.py       # детектор Engulfing
-    ├── filters/
-    │   └── cooldown.py        # анти-спам
+    │   ├── binance_rest.py          # лёгкий REST клиент (httpx)
+    │   ├── pairs.py                 # топ USDT пар
+    │   ├── warmup.py                # параллельная подгрузка истории
+    │   └── ws_manager.py            # WebSocket connector с auto-reconnect
+    ├── detectors/
+    │   ├── base.py                  # Signal dataclass
+    │   ├── velocity.py              # +25
+    │   ├── taker_imbalance.py       # +20
+    │   ├── whale_trades.py          # +20
+    │   ├── volume_anomaly.py        # +15 (intra-candle)
+    │   └── multi_tf_pattern.py      # +25 (Engulfing + 1h trend)
+    ├── scoring/
+    │   └── engine.py                # aggregate() и tiers
+    ├── alerts/
+    │   ├── manager.py               # cooldown, dedup, отправка
+    │   ├── formatter.py             # HTML-форматтеры
+    │   └── followup.py              # +5/+15/+30 min replies
     ├── notifier/
-    │   └── telegram.py        # отправка в TG
-    └── scanner.py             # основной asyncio loop
+    │   └── telegram.py              # httpx async sender
+    ├── storage/
+    │   └── sqlite_log.py            # async SQLite logger
+    └── scanner.py                   # оркестратор
 ```
 
-## Что важно понимать
+## Тюнинг параметров
 
-- **Реагируем только на ЗАКРЫТЫЕ свечи** (`k.x == True`). Пока свеча не закрылась — её паттерн ещё может измениться, и сигнал на промежуточном тике = шум.
-- **Volume Spike + Engulfing срабатывают одновременно — это сильнее**, чем по отдельности. В алерте оба будут перечислены.
-- **Если Volume Spike и Engulfing указывают в разные стороны** — алерт не отправляется (внутреннее противоречие = не доверяем).
+Все в `config.py`:
+
+| Что | Default | Тюнинг |
+|---|---|---|
+| `TOP_N_PAIRS` | 30 | больше пар = больше сигналов, но больше нагрузки |
+| `VELOCITY_PCT_THRESHOLD` | 0.5 | поднять для меньшего шума, опустить для большей чувствительности |
+| `WHALE_NOTIONAL_USD` | 50_000 | для BTC/ETH можно $100k, для мелких alts $20k |
+| `SCORE_MIN_TO_ALERT` | 50 | поднять до 70 если хочешь только качественные алерты |
+| `ALERT_COOLDOWN_SECONDS` | 1800 | 30 мин на пару |
+
+## Анализ accuracy через 2 недели
+
+Все алерты пишутся в `data/signals.db`. Запросы для анализа:
+
+```sql
+-- Win rate по тирам
+SELECT tier, COUNT(*) as alerts FROM alerts GROUP BY tier;
+
+-- Топ-10 пар по количеству алертов
+SELECT symbol, COUNT(*) as cnt FROM alerts GROUP BY symbol ORDER BY cnt DESC LIMIT 10;
+```
+
+Через follow-up'ы можно добавить второй analytics-проход — посмотреть, насколько пары реально росли через 5/15/30 мин после алерта.
 
 ## Roadmap
 
-- [ ] **Phase 2:** добавить таймфреймы 15m + 1h, мульти-TF подтверждение
-- [ ] **Phase 2:** RSI divergence детектор (чаще даёт реальный эдж, чем геометрия)
-- [ ] **Phase 2:** Breakout из консолидации
-- [ ] **Phase 2:** скриншот графика в алерте (через mplfinance)
-- [ ] **Phase 2:** Signal Scoring (0-100, фильтр по минимальной оценке)
-- [ ] **Phase 3:** SQLite-лог всех сигналов + анализ точности (через 2 недели сбора данных)
-- [ ] **Phase 3:** геометрические паттерны (H&S, треугольники, флаги)
+- [ ] **Phase 2:** Order Book Imbalance детектор (depth20 stream)
+- [ ] **Phase 2:** Liquidation Cluster детектор (через !forceOrder с фьючей)
+- [ ] **Phase 2:** RSI Divergence детектор на 15m
+- [ ] **Phase 3:** Web-дашборд для просмотра signals.db и accuracy reports
+- [ ] **Phase 3:** Перенос на VPS (Tokyo region для минимальной latency к Binance)
 
 ## ⚠️ Дисклеймер
 
-Бот **только присылает алерты**. Решения о входе, выходе, размере позиции и стопах — твои. Голый паттерн ≠ торговый сигнал. Используй с фильтрами по тренду, S/R уровням и риск-менеджментом.
-
-Не торговая рекомендация.
+Бот — **только источник информации**. Решение об открытии позиции, размере, стопе и тейке — за тобой.
+Высокий score ≠ гарантированный профит. Это reduces noise, not eliminates it.

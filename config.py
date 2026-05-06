@@ -1,5 +1,7 @@
 """
-Конфигурация сканера — все тюнящиеся параметры здесь.
+Конфигурация Trading Alerts v2.
+
+Все веса, пороги, окна — здесь. Тюним по факту работы (после 2 недель в SQLite-логе).
 """
 import os
 from dotenv import load_dotenv
@@ -10,41 +12,65 @@ load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# === Какие пары скипаем (стейблкоины и фиаты — паттерны на них бессмысленны) ===
+# === Какие пары НЕ сканируем (стейблкоины и фиаты) ===
 EXCLUDE_SYMBOLS = {
     "USDCUSDT", "FDUSDUSDT", "BUSDUSDT", "TUSDUSDT", "USDPUSDT", "DAIUSDT",
-    "EURUSDT", "GBPUSDT", "AUDUSDT", "JPYUSDT", "RUBUSDT", "TRYUSDT",
+    "EURUSDT", "GBPUSDT", "AUDUSDT", "JPYUSDT", "RUBUSDT", "TRYUSDT", "USD1USDT",
 }
 
-# === Сколько топ-пар по объёму мониторим ===
+# === Сколько топ-пар сканируем (по 24h объёму USDT на споте) ===
 TOP_N_PAIRS = 30
 
-# === Таймфрейм для MVP (расширим до 15m/1h в Phase 2) ===
-TIMEFRAME = "5m"
+# === Таймфреймы (свечные стримы) ===
+TIMEFRAMES = ("5m", "15m", "1h")
 
-# === Сколько свечей хранить в памяти на пару ===
-# Должно быть > VOLUME_AVG_PERIOD + 2 для всех расчётов
-CANDLE_BUFFER_SIZE = 50
-
-# === Volume Spike детектор ===
-# Срабатывает если текущий объём > MULTIPLIER × среднее за PERIOD предыдущих свечей
-VOLUME_SPIKE_MULTIPLIER = 3.0
-VOLUME_AVG_PERIOD = 20
-
-# === Engulfing детектор ===
-# Дополнительный объёмный фильтр для поглощений (паттерн без объёма = шум)
-ENGULFING_VOLUME_MULTIPLIER = 1.5
-
-# === Spot-only режим ===
-# Шлём алерты ТОЛЬКО на бычьи (восходящие) сигналы. Медвежьи скипаем,
-# потому что на споте шортить нельзя — медвежий сигнал бесполезен.
+# === Spot-only ===
 ONLY_BULLISH = True
 
-# === Follow-up ===
-# Через сколько секунд после алерта проверять цену и слать апдейт
-# в виде reply на исходное сообщение
-FOLLOWUP_DELAY_SECONDS = 5 * 60  # 5 минут
+# === Cooldown ===
+ALERT_COOLDOWN_SECONDS = 30 * 60  # 30 мин на пару
 
-# === Anti-spam ===
-# Не слать алерты по одной паре чаще раза в N секунд
-ALERT_COOLDOWN_SECONDS = 30 * 60  # 30 минут
+# === Follow-ups: replies на алерт через эти интервалы ===
+FOLLOWUP_DELAYS_SECONDS = (5 * 60, 15 * 60, 30 * 60)
+
+# === Scoring tiers ===
+TIER_WATCH = 50
+TIER_STRONG = 70
+TIER_PREMIUM = 85
+SCORE_MIN_TO_ALERT = 50  # ниже этого — не шлём
+
+# ───────────────────────────────────────────────────────────────────────
+# DETECTORS — у каждого свой score_contribution и параметры
+# ───────────────────────────────────────────────────────────────────────
+
+# === 1. Velocity: цена изменилась на ≥X% за окно ===
+VELOCITY_WINDOW_SECONDS = 30
+VELOCITY_PCT_THRESHOLD = 0.5  # %
+VELOCITY_SCORE = 25
+
+# === 2. Taker Imbalance: market buys >> market sells по объёму ===
+TAKER_IMBALANCE_WINDOW_SECONDS = 60
+TAKER_IMBALANCE_THRESHOLD = 0.70  # 70% объёма должно быть в одну сторону
+TAKER_IMBALANCE_MIN_TRADES = 20    # минимум сделок в окне
+TAKER_IMBALANCE_SCORE = 20
+
+# === 3. Whale Trades: крупные market-ордеры ===
+WHALE_NOTIONAL_USD = 50_000        # одна сделка ≥ $50k
+WHALE_WINDOW_SECONDS = 60
+WHALE_MIN_COUNT = 3
+WHALE_SCORE = 20
+
+# === 4. Volume Anomaly (intra-candle, без ожидания закрытия!) ===
+# Текущая формирующаяся 5m свеча уже накопила больше объёма чем обычно
+VOLUME_ANOMALY_MULTIPLIER = 2.0
+VOLUME_ANOMALY_AVG_PERIOD = 20
+VOLUME_ANOMALY_SCORE = 15
+
+# === 5. Multi-TF Pattern: Engulfing + Volume + 1h тренд (на закрытии 5m) ===
+MULTI_TF_VOLUME_MULT = 1.5
+MULTI_TF_VOLUME_PERIOD = 20
+MULTI_TF_TREND_EMA = 50  # EMA50 на 1h как фильтр тренда
+MULTI_TF_SCORE = 25
+
+# === SQLite ===
+DB_PATH = "data/signals.db"

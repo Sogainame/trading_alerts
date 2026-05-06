@@ -1,220 +1,162 @@
 """
-Основной цикл сканера.
+Scanner v2 — главный оркестратор.
 
-Что происходит:
-  1. Получаем топ-N USDT пар по объёму
-  2. Подгружаем последние CANDLE_BUFFER_SIZE свечей по каждой паре (warmup)
-  3. Подключаемся к мультиплекс WebSocket Binance
-  4. Слушаем kline-стримы. Реагируем ТОЛЬКО на закрытые свечи (k.x == True)
-  5. На каждой закрытой свече прогоняем все детекторы
-  6. Если паттерн прошёл фильтры (BULLISH, не cooldown) — шлём алерт
-  7. После успешной отправки алерта — планируем follow-up через N минут (reply с %изменения)
+Hot path:
+  WebSocket message → parse → update state → run detectors → score → maybe_alert
+
+Все операции async и неблокирующие. Один event loop.
 """
-import asyncio
 import logging
-from typing import List, Optional
+from typing import List
 
-from binance import AsyncClient, BinanceSocketManager
-
-from config import (
-    CANDLE_BUFFER_SIZE,
-    FOLLOWUP_DELAY_SECONDS,
-    ONLY_BULLISH,
-    TIMEFRAME,
-)
-from src.data.candle_buffer import Candle, CandleBuffer
+from config import TIMEFRAMES
+from src.alerts.followup import FollowupScheduler
+from src.alerts.manager import AlertManager
+from src.core.state import Candle, GlobalState, SymbolState, Trade
+from src.data.binance_rest import BinanceREST
 from src.data.pairs import get_top_usdt_pairs
-from src.filters.cooldown import CooldownFilter
-from src.notifier.telegram import TelegramNotifier, format_alert, format_followup
-from src.patterns.engulfing import detect_engulfing
-from src.patterns.volume_spike import detect_volume_spike
+from src.data.warmup import warmup_all
+from src.data.ws_manager import WebSocketManager
+from src.detectors.multi_tf_pattern import detect_multi_tf_pattern
+from src.detectors.taker_imbalance import detect_taker_imbalance
+from src.detectors.velocity import detect_velocity
+from src.detectors.volume_anomaly import detect_volume_anomaly
+from src.detectors.whale_trades import detect_whale_trades
+from src.notifier.telegram import TelegramNotifier
+from src.scoring.engine import aggregate
+from src.storage.sqlite_log import SignalLogger
 
 logger = logging.getLogger(__name__)
 
 
 class Scanner:
     def __init__(self) -> None:
-        self.buffer = CandleBuffer()
-        self.cooldown = CooldownFilter()
+        self.state = GlobalState()
+        self.rest = BinanceREST()
         self.notifier = TelegramNotifier()
+        self.signal_logger = SignalLogger()
+        self.followup = FollowupScheduler(self.notifier, self.rest)
+        self.alert_manager = AlertManager(
+            self.notifier, self.followup, self.signal_logger
+        )
         self.symbols: List[str] = []
-        self.client: Optional[AsyncClient] = None
-        # Фоновые follow-up задачи. Держим ссылки чтобы asyncio их не убил GC'ом
-        self._followup_tasks: set[asyncio.Task] = set()
 
-    async def warmup(self) -> None:
-        """
-        Подгрузить историческую глубину свечей для каждой пары через REST,
-        чтобы детекторы сразу могли считать средние и работать с первой же закрытой свечи.
-        """
-        logger.info(
-            f"Warming up: fetching ~{CANDLE_BUFFER_SIZE} candles for {len(self.symbols)} pairs..."
-        )
+    # ─────────────────────────────────────────────────────────────────
+    # Hot path: WebSocket message handler
+    # ─────────────────────────────────────────────────────────────────
 
-        for symbol in self.symbols:
-            try:
-                # Берём CANDLE_BUFFER_SIZE+1, потом отрезаем последнюю (она формируется)
-                klines = await self.client.get_klines(
-                    symbol=symbol,
-                    interval=TIMEFRAME,
-                    limit=CANDLE_BUFFER_SIZE + 1,
-                )
-                # Последняя свеча в ответе — текущая, ещё не закрытая, отбрасываем
-                candles = [Candle.from_rest(k) for k in klines[:-1]]
-                self.buffer.init(symbol, candles)
-            except Exception as e:
-                logger.warning(f"Failed to warmup {symbol}: {e}")
-
-        logger.info("Warmup done.")
-
-    async def _schedule_followup(
-        self, symbol: str, entry_price: float, reply_to_message_id: Optional[int]
-    ) -> None:
-        """
-        Через FOLLOWUP_DELAY_SECONDS получаем текущую цену и шлём апдейт
-        как reply на исходный алерт.
-
-        Использует REST endpoint /api/v3/ticker/price — всегда отдаёт последнюю
-        известную цену (а не цену на закрытии следующей свечи).
-        """
-        delay = FOLLOWUP_DELAY_SECONDS
-        delay_minutes = delay // 60
-        try:
-            await asyncio.sleep(delay)
-            ticker = await self.client.get_symbol_ticker(symbol=symbol)
-            current_price = float(ticker["price"])
-            msg = format_followup(symbol, entry_price, current_price, delay_minutes)
-            await self.notifier.send(msg, reply_to=reply_to_message_id)
-            logger.info(
-                f"FOLLOW-UP SENT: {symbol} entry={entry_price:.6g} "
-                f"current={current_price:.6g} "
-                f"change={(current_price - entry_price) / entry_price * 100:+.2f}%"
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            logger.warning(f"Follow-up failed for {symbol}: {e}")
-
-    def _spawn_followup(
-        self, symbol: str, entry_price: float, reply_to_message_id: Optional[int]
-    ) -> None:
-        """
-        Запустить follow-up как фоновую задачу, не блокируя основной цикл.
-        Сохраняем ссылку чтобы её не собрал GC, и удаляем по завершении.
-        """
-        task = asyncio.create_task(
-            self._schedule_followup(symbol, entry_price, reply_to_message_id)
-        )
-        self._followup_tasks.add(task)
-        task.add_done_callback(self._followup_tasks.discard)
-
-    async def on_candle_closed(self, symbol: str, candle: Candle) -> None:
-        """
-        Вызывается при закрытии каждой 5m свечи на любой из отслеживаемых пар.
-        Здесь — вся торговая логика MVP.
-        """
-        self.buffer.add(symbol, candle)
-
-        # Cooldown проверяем ДО детекторов — нет смысла считать если всё равно не отправим
-        if not self.cooldown.can_alert(symbol):
+    async def handle_ws_message(self, msg: dict) -> None:
+        # Combined-stream формат: {"stream": "...", "data": {...}}
+        data = msg.get("data")
+        if not data:
             return
+        event = data.get("e")
+        symbol = data.get("s")
+        if not symbol:
+            return
+        st = self.state.get_or_create(symbol)
 
-        signals: List[dict] = []
+        if event == "aggTrade":
+            await self._on_trade(st, data)
+        elif event == "kline":
+            await self._on_kline(st, data)
 
-        vs = detect_volume_spike(self.buffer, symbol)
-        if vs:
-            signals.append(vs)
+    async def _on_trade(self, state: SymbolState, data: dict) -> None:
+        trade = Trade(
+            timestamp=data["T"],
+            price=float(data["p"]),
+            quantity=float(data["q"]),
+            is_buyer_maker=data["m"],
+        )
+        state.trades.append(trade)
 
-        eng = detect_engulfing(self.buffer, symbol)
-        if eng:
-            signals.append(eng)
+        # Запускаем trade-driven детекторы. Они работают на trade-buffer.
+        signals = []
+        for detector in (
+            detect_velocity,
+            detect_taker_imbalance,
+            detect_whale_trades,
+            detect_volume_anomaly,
+        ):
+            sig = detector(state)
+            if sig:
+                signals.append(sig)
 
         if not signals:
             return
 
-        # Если оба сигнала, но направления разные — пропускаем (конфликт = не доверяем)
-        directions = {s["direction"] for s in signals}
-        if len(directions) > 1:
-            logger.debug(f"{symbol}: conflicting directions, skipping")
-            return
+        result = aggregate(signals)
+        await self.alert_manager.maybe_alert(state, result, trade.price)
 
-        direction = next(iter(directions))
+    async def _on_kline(self, state: SymbolState, data: dict) -> None:
+        k = data["k"]
+        interval = k["i"]
+        is_closed = bool(k.get("x", False))
+        candle = Candle.from_ws_kline(k, is_closed=is_closed)
 
-        # Spot-only: медвежьи (BEARISH) сигналы скипаем — на споте шортить нельзя
-        if ONLY_BULLISH and direction == "BEARISH":
-            logger.debug(f"{symbol}: BEARISH signal skipped (ONLY_BULLISH=True)")
-            return
+        if interval == "5m":
+            if is_closed:
+                state.candles_5m.append(candle)
+                state.current_5m = None  # свеча закрылась
+                # На закрытии 5m — запускаем тяжёлый pattern-детектор
+                pattern_sig = detect_multi_tf_pattern(state)
+                if pattern_sig is not None:
+                    # Combine с активными trade-driven сигналами в ту же сторону
+                    extra = []
+                    for det in (
+                        detect_velocity,
+                        detect_taker_imbalance,
+                        detect_whale_trades,
+                    ):
+                        s = det(state)
+                        if s and s.direction == pattern_sig.direction:
+                            extra.append(s)
+                    result = aggregate([pattern_sig] + extra)
+                    await self.alert_manager.maybe_alert(state, result, candle.close)
+            else:
+                # Свеча в моменте — обновляем current_5m, чтобы Volume Anomaly мог его видеть
+                state.current_5m = candle
+        elif interval == "15m":
+            if is_closed:
+                state.candles_15m.append(candle)
+        elif interval == "1h":
+            if is_closed:
+                state.candles_1h.append(candle)
 
-        msg = format_alert(symbol, signals, TIMEFRAME)
-        result = await self.notifier.send(msg)
-        if not result:
-            return
-
-        self.cooldown.mark_alerted(symbol)
-        message_id = result.get("message_id")
-        logger.info(
-            f"ALERT SENT: {symbol} • {' + '.join(s['pattern'] for s in signals)} "
-            f"• {direction} • vol×{max(s['volume_multiplier'] for s in signals):.1f}"
-        )
-
-        # Запланировать follow-up через FOLLOWUP_DELAY_SECONDS
-        self._spawn_followup(symbol, candle.close, message_id)
+    # ─────────────────────────────────────────────────────────────────
+    # Lifecycle
+    # ─────────────────────────────────────────────────────────────────
 
     async def run(self) -> None:
-        self.client = await AsyncClient.create()
         try:
-            self.symbols = await get_top_usdt_pairs(self.client)
+            self.symbols = await get_top_usdt_pairs(self.rest)
             logger.info(
-                f"Top {len(self.symbols)} USDT pairs: {', '.join(self.symbols[:10])}..."
+                f"Top {len(self.symbols)} USDT pairs: "
+                f"{', '.join(self.symbols[:10])}..."
             )
 
-            await self.warmup()
+            await warmup_all(self.rest, self.symbols, list(TIMEFRAMES), self.state)
+            await self.signal_logger.init()
 
-            mode_str = "BULLISH only" if ONLY_BULLISH else "BULLISH + BEARISH"
             await self.notifier.send(
-                f"🟢 <b>Scanner started</b>\n"
-                f"Monitoring <b>{len(self.symbols)}</b> USDT pairs on <b>{TIMEFRAME}</b>\n"
-                f"Mode: {mode_str}\n"
-                f"Follow-up: +{FOLLOWUP_DELAY_SECONDS // 60} min after each alert"
+                f"🟢 <b>Scanner v2 started</b>\n"
+                f"Monitoring <b>{len(self.symbols)}</b> USDT pairs\n"
+                f"Detectors: Velocity, Taker Imbalance, Whale, Volume Anomaly, Multi-TF Pattern\n"
+                f"Mode: Spot-only (BULLISH alerts), tiers: WATCH 50 / STRONG 70 / PREMIUM 85"
             )
 
-            bsm = BinanceSocketManager(self.client)
-            streams = [f"{s.lower()}@kline_{TIMEFRAME}" for s in self.symbols]
-            socket = bsm.multiplex_socket(streams)
+            # Собираем список потоков: aggTrade + kline для каждого ТФ
+            streams: List[str] = []
+            for s in self.symbols:
+                low = s.lower()
+                streams.append(f"{low}@aggTrade")
+                for tf in TIMEFRAMES:
+                    streams.append(f"{low}@kline_{tf}")
 
-            async with socket as stream:
-                logger.info(
-                    f"WebSocket connected ({len(streams)} streams). Listening for candle closes..."
-                )
-                while True:
-                    msg = await stream.recv()
-                    if not msg or "data" not in msg:
-                        continue
-
-                    data = msg["data"]
-                    if data.get("e") != "kline":
-                        continue
-
-                    k = data["k"]
-                    # k.x == True ⇔ свеча ЗАКРЫТА. Это критично — иначе будем
-                    # реагировать на промежуточные тики и генерить мусорные сигналы
-                    if not k.get("x"):
-                        continue
-
-                    symbol = data["s"]
-                    candle = Candle.from_ws_kline(k)
-                    await self.on_candle_closed(symbol, candle)
-
+            ws = WebSocketManager(streams, self.handle_ws_message)
+            await ws.run_forever()
         finally:
-            # Дать висящим follow-up задачам завершиться (или отменить если очень долго)
-            if self._followup_tasks:
-                logger.info(
-                    f"Cancelling {len(self._followup_tasks)} pending follow-up tasks..."
-                )
-                for t in list(self._followup_tasks):
-                    t.cancel()
-                await asyncio.gather(*self._followup_tasks, return_exceptions=True)
-
-            if self.client:
-                await self.client.close_connection()
+            await self.followup.shutdown()
+            await self.signal_logger.close()
             await self.notifier.close()
+            await self.rest.close()
