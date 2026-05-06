@@ -25,7 +25,7 @@ Thumbs.db
 logs/
 
 # SQLite signal log (создаётся локально при запуске)
-data/
+/data/
 *.db
 *.db-shm
 *.db-wal
