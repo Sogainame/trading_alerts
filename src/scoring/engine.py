@@ -16,7 +16,7 @@ from config import TIER_PREMIUM, TIER_STRONG, TIER_WATCH
 from src.detectors.base import Signal
 
 
-@dataclass(slots=True)
+@dataclass
 class ScoringResult:
     score: int
     direction: str  # "BULLISH" | "BEARISH" | "NEUTRAL"

@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 
-@dataclass(slots=True)
+@dataclass
 class Signal:
     detector_name: str
     direction: str            # "BULLISH" | "BEARISH"

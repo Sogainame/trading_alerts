@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from typing import Deque, Dict, List, Optional
 
 
-@dataclass(slots=True)
+@dataclass
 class Trade:
     """Aggregated trade from @aggTrade stream."""
     timestamp: int      # ms
@@ -27,7 +27,7 @@ class Trade:
         return not self.is_buyer_maker
 
 
-@dataclass(slots=True)
+@dataclass
 class Candle:
     open_time: int
     open: float
@@ -65,7 +65,7 @@ class Candle:
         )
 
 
-@dataclass(slots=True)
+@dataclass
 class SymbolState:
     """All in-memory state for one trading pair."""
     symbol: str
